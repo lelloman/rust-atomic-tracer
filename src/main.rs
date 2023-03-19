@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAIN_LOOP_SLEEP_INTERVAL: Duration = Duration::from_secs(1);
 const RECORDING_DURATION: Duration = Duration::from_secs(30);
 
-const trace_pipe_path: &str = "/sys/kernel/debug/tracing/trace_pipe";
-const dst_dir_path: &str = "/home/lelloman/monnezza-2";
+const TRACE_PIPE_PATH: &str = "/sys/kernel/debug/tracing/trace_pipe";
+const DST_DIR_PATH: &str = "/home/lelloman/monnezza-2";
 
 type RecorderHandle = std::thread::JoinHandle<()>;
 
@@ -73,13 +73,13 @@ fn parse_line(line: &String, line_regex: &Regex) -> ParseResult {
 }
 
 fn save_recording_file(recording: Recording) {
-    let dst_file = std::fs::OpenOptions::new()
+    let mut dst_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(format!("{}/{}", dst_dir_path, now_ms().to_string()))
+        .open(format!("{}/{}", DST_DIR_PATH, now_ms().to_string()))
         .expect("Could not create save file");
     let recording_string = format!(
-        "start:{}\nend:{}\nenabled:{}\nsuccess:{}\nfailure:{}\nunparsable:{}",
+        "start:{}\nend:{}\nenabled:{}\nsuccess:{}\nfailure:{}\nunparsable:{}\n",
         recording.start_time,
         now_ms(),
         recording.enabled,
@@ -94,7 +94,7 @@ fn start_recorder(
     boost_enabled: bool,
     running: Arc<AtomicBool>,
 ) -> Result<RecorderHandle> {
-    let trace_pipe = File::open(trace_pipe_path).expect("Could not open trace pipe file");
+    let trace_pipe = File::open(TRACE_PIPE_PATH).expect("Could not open trace pipe file");
     let mut reader = BufReader::new(trace_pipe);
 
     let mut buf = String::from_utf8(vec![0u8; 4096]).unwrap();
