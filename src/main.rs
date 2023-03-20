@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use regex::Regex;
 use std::fs::File;
 use std::io::Write;
@@ -9,13 +10,24 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAIN_LOOP_SLEEP_INTERVAL: Duration = Duration::from_secs(1);
-const RECORDING_DURATION: Duration = Duration::from_secs(30);
-
 const TRACE_PIPE_PATH: &str = "/sys/kernel/debug/tracing/trace_pipe";
-const DST_DIR_PATH: &str = "/home/lelloman/monnezza-2";
+const DEFAULT_DST_DIR_PATH: &str = "/home/lelloman/monnezza-2";
+const DEFAULT_MAIN_LOOP_SLEEP_SECS: u64 = 1;
+const DEFAULT_RECORDING_DURATION_SECS: u64 = 20;
 
 type RecorderHandle = std::thread::JoinHandle<()>;
+
+#[derive(Parser, Debug)]
+struct CliArgs {
+    #[clap(short, long, default_value = DEFAULT_DST_DIR_PATH)]
+    pub dst_dir_path: String,
+
+    #[clap(short, long, default_value_t = DEFAULT_MAIN_LOOP_SLEEP_SECS)]
+    pub main_loop_sleep_secs: u64,
+
+    #[clap(short, long, default_value_t = DEFAULT_RECORDING_DURATION_SECS)]
+    pub recording_duration_secs: u64,
+}
 
 struct Recording {
     pub start_time: u128,
@@ -42,21 +54,21 @@ fn now_ms() -> u128 {
 fn parse_line(line: &String, line_regex: &Regex) -> ParseResult {
     match line_regex.captures(&line) {
         None => {
-            println!("failed to capture line");
+            //println!("failed to capture line");
             ParseResult::Unparsable
         }
         Some(capture) => match capture.get(1) {
             None => {
-                println!("Failed to get parsed line group");
+                //println!("Failed to get parsed line group");
                 ParseResult::Unparsable
             }
             Some(captured_group) => match u128::from_str_radix(captured_group.as_str(), 16) {
                 Ok(value) => {
-                    println!(
+                    /*println!(
                         "Captured group: <{}> value: {}",
                         captured_group.as_str(),
                         value
-                    );
+                    );*/
                     if value == 0 {
                         ParseResult::Failed
                     } else {
@@ -64,7 +76,7 @@ fn parse_line(line: &String, line_regex: &Regex) -> ParseResult {
                     }
                 }
                 Err(_) => {
-                    println!("Failed to parse value {}", captured_group.as_str());
+                    //println!("Failed to parse value {}", captured_group.as_str());
                     ParseResult::Unparsable
                 }
             },
@@ -72,11 +84,11 @@ fn parse_line(line: &String, line_regex: &Regex) -> ParseResult {
     }
 }
 
-fn save_recording_file(recording: Recording) {
+fn save_recording_file(dst_dir_path: &str, recording: Recording) {
     let mut dst_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(format!("{}/{}", DST_DIR_PATH, now_ms().to_string()))
+        .open(format!("{}/{}", dst_dir_path, now_ms().to_string()))
         .expect("Could not create save file");
     let recording_string = format!(
         "start:{}\nend:{}\nenabled:{}\nsuccess:{}\nfailure:{}\nunparsable:{}\n",
@@ -91,6 +103,7 @@ fn save_recording_file(recording: Recording) {
 }
 
 fn start_recorder(
+    dst_dir_path: String,
     boost_enabled: bool,
     running: Arc<AtomicBool>,
 ) -> Result<RecorderHandle> {
@@ -99,7 +112,7 @@ fn start_recorder(
 
     let mut buf = String::from_utf8(vec![0u8; 4096]).unwrap();
     let line_regex = Regex::new(r".*page=([A-z0-9]+)\s.*").unwrap();
-    let mut enabled = return Ok(std::thread::spawn(move || {
+    return Ok(std::thread::spawn(move || {
         let mut recording = Recording {
             start_time: now_ms(),
             enabled: boost_enabled,
@@ -111,8 +124,7 @@ fn start_recorder(
             buf.clear();
             match reader.read_line(&mut buf) {
                 Ok(_) => {
-                    let parsed_result = parse_line(&buf, &line_regex);
-                    println!("read line: {:?}", parsed_result);
+                    let parsed_result = parse_line(&buf, &line_regex);                    
                     match parsed_result {
                         ParseResult::Successful => recording.successful_allocations += 1,
                         ParseResult::Failed => recording.failed_allocations += 1,
@@ -127,7 +139,7 @@ fn start_recorder(
         }
 
         println!("Recording stopped, saving file...");
-        save_recording_file(recording);
+        save_recording_file(&dst_dir_path, recording);
         println!("Saved file")
     }));
 }
@@ -140,28 +152,50 @@ fn setup_ctrl(running: Arc<AtomicBool>) {
     .expect("Error setting Ctrl-C handler");
 }
 
+fn set_eboost(enabled: bool) -> Result<()> {
+    let arg = if enabled { "--on" } else { "--off" };
+    Ok(std::process::Command::new("eboostctl")
+        .arg(arg)
+        .output()
+        .map(|_| ())?)
+}
+
 fn main() {
+    let cli_args = CliArgs::parse();
     let running = Arc::new(AtomicBool::new(true));
     setup_ctrl(running.clone());
 
     let recorder_running = Arc::new(AtomicBool::new(true));
     let mut boost_enabled = true;
+    set_eboost(boost_enabled);
 
-    let mut recorder_handle =
-        start_recorder(boost_enabled, recorder_running.clone()).expect("Could not start recorder");
+    let mut recorder_handle = start_recorder(
+        cli_args.dst_dir_path.clone(),
+        boost_enabled,
+        recorder_running.clone(),
+    )
+    .expect("Could not start recorder");
     let mut start_time = Instant::now();
 
+    let loop_sleep_interval = Duration::from_secs(cli_args.main_loop_sleep_secs);
+    let recording_duration = Duration::from_secs(cli_args.recording_duration_secs);
     while running.load(Ordering::SeqCst) {
-        sleep(MAIN_LOOP_SLEEP_INTERVAL);
+        sleep(loop_sleep_interval);
         let now = Instant::now();
-        if now - start_time > RECORDING_DURATION {
+        if now - start_time > recording_duration {
+            boost_enabled = !boost_enabled;
+            set_eboost(boost_enabled);
             recorder_running.store(false, Ordering::SeqCst);
             recorder_handle
                 .join()
                 .expect("Could not join recorder thread");
             recorder_running.store(true, Ordering::SeqCst);
-            recorder_handle =
-                start_recorder(boost_enabled, recorder_running.clone()).expect("Could not start recorder");
+            recorder_handle = start_recorder(
+                cli_args.dst_dir_path.clone(),
+                boost_enabled,
+                recorder_running.clone(),
+            )
+            .expect("Could not start recorder");
             start_time = now;
             println!("Flip recording");
         }
